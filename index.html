@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Anatomy of a QR Code — The Lab</title>
+  <meta name="description" content="Build a QR code module by module, then vandalize it and watch Reed–Solomon error correction bring it back from the dead. Interactive, zero dependencies." />
+  <link rel="stylesheet" href="lab.css" />
+  <style>
+    :root { --accent: #ffb01f; --accent-soft: #4a3a12; --accent-ink: #1a1200; }
+    /* module role colors */
+    :root {
+      --c-finder:  #6c8cff;
+      --c-timing:  #46c7b8;
+      --c-align:   #b98bff;
+      --c-format:  #ff77c2;
+      --c-dark:    #8894ad;
+      --c-data:    #ffb01f;
+      --c-ecc:     #4ad07b;
+      --c-remain:  #5b6377;
+    }
+    .qr-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 26px; align-items: start; }
+    @media (max-width: 860px) { .qr-layout { grid-template-columns: 1fr; } }
+    .qr-stagewrap { position: relative; }
+    #qr-canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; border-radius: 10px; cursor: crosshair; touch-action: none; }
+    .qr-side { display: flex; flex-direction: column; gap: 18px; }
+    .legend { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+    .legend .li { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-soft); }
+    .legend .sw { width: 13px; height: 13px; border-radius: 3px; flex: none; box-shadow: 0 0 0 1px rgba(255,255,255,.12) inset; }
+    .meter { height: 9px; border-radius: 6px; background: var(--surface-2); overflow: hidden; border: 1px solid var(--line); }
+    .meter > i { display: block; height: 100%; width: 0%; background: linear-gradient(90deg, var(--c-ecc), #ffd23f 70%, #ff5c5c); transition: width .18s ease; }
+    .verdict { font-family: var(--mono); font-size: 13px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface-2); line-height: 1.5; }
+    .verdict.ok    { border-color: color-mix(in oklab, var(--c-ecc) 55%, var(--line)); }
+    .verdict.dead  { border-color: color-mix(in oklab, #ff5c5c 55%, var(--line)); }
+    .verdict .big { font-size: 14px; font-weight: 600; color: var(--ink); display: flex; align-items: center; gap: 8px; }
+    .verdict .dot2 { width: 9px; height: 9px; border-radius: 50%; background: var(--c-ecc); }
+    .verdict.dead .dot2 { background: #ff5c5c; }
+    .qr-tooltip { position: absolute; pointer-events: none; z-index: 5; background: #05060a; border: 1px solid var(--line-2);
+      border-radius: 8px; padding: 7px 10px; font-family: var(--mono); font-size: 11.5px; color: var(--ink); opacity: 0; transition: opacity .1s;
+      white-space: nowrap; transform: translate(-50%, -120%); box-shadow: 0 8px 24px rgba(0,0,0,.6); }
+    .qr-tooltip b { color: var(--accent); }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 18px; }
+    .grow { flex: 1 1 240px; }
+    .hint { font-size: 13px; color: var(--ink-mute); }
+    .statline { font-family: var(--mono); font-size: 12.5px; color: var(--ink-mute); }
+    .statline b { color: var(--ink); }
+    .brushrow { display:flex; align-items:center; gap:10px; }
+  </style>
+</head>
+<body>
+  <nav class="labnav">
+    <div class="wrap">
+      <a class="brand" href="https://github.com/moshejs"><span class="dot"></span> The Lab</a>
+      <span class="spacer"></span>
+      <a class="navlink" href="https://github.com/moshejs/qr-code-anatomy">Source ↗</a>
+    </div>
+  </nav>
+
+  <header class="exhead wrap">
+    <span class="eyebrow">Exhibit 01 · Error correction</span>
+    <h1 class="title">Anatomy of a QR code</h1>
+    <p class="dek">Build one from scratch, watch it assemble cell by cell — then take a knife to it and see it refuse to die.</p>
+  </header>
+
+  <main class="wrap">
+    <div class="metastrip">
+      <span><b>Byte mode</b> encoder</span>
+      <span><b>Reed–Solomon</b> ECC + live decoder</span>
+      <span><b>0</b> dependencies</span>
+      <span><b>~600</b> lines of hand-written GF(256)</span>
+    </div>
+
+    <section class="read prose stack">
+      <p>Every QR code you've ever scanned is quietly heroic. You point your phone at one that's been folded, printed on a crumpled receipt, half-covered by a coffee ring, or slapped with a sticker — and it just works. That resilience isn't luck. It's <strong>Reed–Solomon error correction</strong>, the same math that keeps CDs playing through scratches and spacecraft talking across the solar system, baked into a little black-and-white square.</p>
+      <p>This page has a complete QR encoder and a real Reed–Solomon decoder running in your browser — no libraries, no server. Type something, watch it build, then start destroying it.</p>
+    </section>
+
+    <!-- ============ THE INTERACTIVE ============ -->
+    <section style="margin: 34px 0 10px;">
+      <div class="toolbar">
+        <div class="field grow">
+          <label for="qr-text">Encode this</label>
+          <input id="qr-text" type="text" maxlength="180" value="https://moshemalka.com/lab" />
+        </div>
+        <div class="field">
+          <label>Error correction</label>
+          <div class="chips" id="qr-ecl" role="group" aria-label="Error correction level">
+            <span class="chip" data-ecl="L" aria-pressed="false" title="~7% recoverable">L</span>
+            <span class="chip" data-ecl="M" aria-pressed="true"  title="~15% recoverable">M</span>
+            <span class="chip" data-ecl="Q" aria-pressed="false" title="~25% recoverable">Q</span>
+            <span class="chip" data-ecl="H" aria-pressed="false" title="~30% recoverable">H</span>
+          </div>
+        </div>
+        <button class="btn" id="qr-build">↻ Rebuild &amp; animate</button>
+      </div>
+
+      <div class="qr-layout">
+        <div class="panel qr-stagewrap" style="padding: 22px;">
+          <div class="stage">
+            <canvas id="qr-canvas" width="420" height="420" aria-label="QR code"></canvas>
+          </div>
+          <div class="qr-tooltip" id="qr-tip"></div>
+          <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-top:14px;">
+            <div class="chips" id="qr-mode" role="group" aria-label="View mode">
+              <span class="chip" data-mode="roles" aria-pressed="true">Colour by role</span>
+              <span class="chip" data-mode="scan"  aria-pressed="false">Scan view</span>
+            </div>
+            <span class="chips" id="qr-tool" role="group" aria-label="Tool">
+              <span class="chip" data-tool="inspect" aria-pressed="true">🔍 Inspect</span>
+              <span class="chip" data-tool="damage"  aria-pressed="false">🔨 Damage</span>
+            </span>
+            <button class="btn ghost" id="qr-repair" style="margin-left:auto;">Repair all</button>
+          </div>
+          <p class="hint" id="qr-hint" style="margin-top:12px;">Hover a cell to see its job. Switch to <b>Damage</b> and drag across the code to knock cells out.</p>
+        </div>
+
+        <aside class="qr-side">
+          <div class="panel" style="padding:16px;">
+            <div class="statline" id="qr-facts" style="margin-bottom:12px;"></div>
+            <div class="legend" id="qr-legend"></div>
+          </div>
+
+          <div class="panel" style="padding:16px; display:flex; flex-direction:column; gap:10px;">
+            <div class="statline">Damage vs. safety margin</div>
+            <div class="meter"><i id="qr-meter"></i></div>
+            <div class="statline" id="qr-budget"><b>0</b> of <b>0</b> recoverable symbols spent</div>
+            <div class="verdict ok" id="qr-verdict">
+              <div class="big"><span class="dot2"></span><span id="qr-verdict-title">Pristine</span></div>
+              <div id="qr-verdict-body" style="margin-top:6px; color: var(--ink-soft);">Decodes cleanly.</div>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ============ THE EXPLAINER ============ -->
+    <section class="read prose stack" style="margin-top: 46px;">
+      <h2>What are all those cells doing?</h2>
+      <p>Flip to <strong>Colour by role</strong> above and hover around. A QR code isn't a bitmap of your data — most of it is scaffolding the scanner needs to even find and orient the code:</p>
+      <p>The three big <span style="color:var(--c-finder)"><strong>■ finder</strong></span> squares in the corners let a camera lock on from any angle. The <span style="color:var(--c-timing)"><strong>■ timing</strong></span> lines running between them are a ruler — a strict alternating pattern that tells the scanner how big each cell is. Larger codes sprinkle in <span style="color:var(--c-align)"><strong>■ alignment</strong></span> markers to fight lens distortion, and a ring of <span style="color:var(--c-format)"><strong>■ format</strong></span> cells around the finders spells out which error-correction level and mask were used.</p>
+      <p>Only the <span style="color:var(--c-data)"><strong>■ data</strong></span> cells carry your actual message. And right alongside them sits the hero of this whole story: the <span style="color:var(--c-ecc)"><strong>■ parity</strong></span> cells.</p>
+
+      <h2>The mask: why it looks like noise</h2>
+      <p>A good QR code should be a roughly 50/50 salt-and-pepper mess. Big blank runs or accidental finder-lookalikes confuse scanners. So after laying down the data, the encoder XORs the whole thing with one of <strong>8 checkerboard patterns</strong> — the <em>mask</em> — and keeps whichever result scores best against a set of penalty rules. That's why two nearly identical strings can produce wildly different-looking codes.</p>
+
+      <h2>Reed–Solomon: the part that feels like magic</h2>
+      <p>Here's the trick. Your message is chopped into 8-bit <strong>codewords</strong> — think of them as numbers from 0 to 255. Reed–Solomon treats those numbers as points and fits a polynomial through them, then <em>writes down extra points from the same polynomial</em>. Those extra points are the <span style="color:var(--c-ecc)"><strong>parity codewords</strong></span>.</p>
+      <p>Now damage the code. Some points get corrupted. But a polynomial of degree <em>k</em> is fully pinned down by any <em>k</em> good points — so as long as enough survive, the decoder can reconstruct the exact original curve and read off the true values. Even better, it doesn't need to be <em>told</em> which cells are wrong; the algebra locates the errors <em>and</em> fixes them.</p>
+      <p>Each level buys a different safety margin: <strong>L</strong> shrugs off ~7% damage, <strong>M</strong> ~15%, <strong>Q</strong> ~25%, and <strong>H</strong> survives roughly <strong>30%</strong> of the code being obliterated. That's why the logo in the middle of a fancy QR code works — the designer just cranked the error correction up and let it eat the hole.</p>
+      <p>The decoder above is the genuine article: syndromes → Berlekamp–Massey → Chien search → Forney. When you knock out cells, it really is solving for the errors and telling you, live, whether your vandalism stayed inside the safety margin. Go find its breaking point.</p>
+    </section>
+
+    <section class="read" style="margin-top:40px;">
+      <div class="panel" style="padding:20px 22px;">
+        <div class="statline" style="margin-bottom:8px;">TRY THIS</div>
+        <div class="prose" style="color:var(--ink-soft)">
+          Set the level to <b>H</b>, rebuild, then scribble a diagonal slash right across the middle with the Damage tool. Watch the meter climb and the verdict hold at <b>recovered</b> — then keep going until it finally dies.
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="labfoot">
+    <div class="wrap">
+      <span>The Lab — handmade interactive explainers.</span>
+      <span class="spacer" style="flex:1"></span>
+      <a href="https://github.com/moshejs/qr-code-anatomy">Source ↗</a>
+    </div>
+  </footer>
+
+  <script src="qrcode.js"></script>
+  <script src="qr.js"></script>
+</body>
+</html>
