@@ -8,168 +8,230 @@
    bit was XORed over it. That lets the UI read the codewords back
    out of a *damaged* matrix and run real error correction on them.
 
-   RS decode = syndromes → Berlekamp–Massey → Chien search → Forney.
+   RS decode = syndromes → key equation by extended Euclid (Sugiyama)
+   → Chien search → Forney.
    GF(256), primitive element α=2, prim. polynomial 0x11D.
    ============================================================ */
 (function (global) {
   "use strict";
 
-  /* ---------------- GF(256) arithmetic ---------------- */
-  const EXP = new Uint8Array(512);
-  const LOG = new Uint8Array(256);
-  (function initTables() {
-    let x = 1;
-    for (let i = 0; i < 255; i++) {
-      EXP[i] = x;
-      LOG[x] = i;
-      x <<= 1;
-      if (x & 0x100) x ^= 0x11d;
+  /* ---------------- GF(2^8) and Reed–Solomon ----------------
+     Independent implementation (2026-11-24) of the standard mathematics, as
+     presented in:
+       - ISO/IEC 18004 (QR Code), error-correction section: field GF(2^8) with
+         primitive polynomial x^8+x^4+x^3+x^2+1 (0x11D), primitive element α = 2,
+         generator g(x) = (x − α^0)(x − α^1)…(x − α^(n−k−1)), check symbols =
+         remainder of m(x)·x^(n−k) divided by g(x).
+       - S. Lin & D. J. Costello, "Error Control Coding" (2nd ed.), ch. 7:
+         syndromes, key equation, Euclidean-algorithm decoding, Chien search,
+         Forney's formula.
+       - R. E. Blahut, "Algebraic Codes for Data Transmission", ch. 7.
+       - Y. Sugiyama, M. Kasahara, S. Hirasawa, T. Namekawa, "A method for
+         solving key equation for decoding Goppa codes", Information and
+         Control 27 (1975) — the extended-Euclid solution of the key equation.
+
+     Internal convention: a polynomial is a plain array of coefficients in
+     ASCENDING degree (p[i] multiplies x^i). The QR byte stream is the
+     opposite (first codeword = highest power), so the exported functions
+     below translate at the boundary.
+     Decoding: syndromes → key equation by extended Euclid (Sugiyama) →
+     Chien search → Forney with the formal derivative. Errors only. */
+
+  const GF = (() => {
+    const POLY = 0x11d;
+    // carry-less "shift and add" product, reduced modulo POLY as it goes
+    const slowMul = (a, b) => {
+      let acc = 0;
+      while (b) {
+        if (b & 1) acc ^= a;
+        b >>= 1;
+        a <<= 1;
+        if (a & 0x100) a ^= POLY;
+      }
+      return acc;
+    };
+    const antilog = new Array(255); // antilog[i] = α^i
+    const logOf = new Array(256).fill(-1); // logOf[α^i] = i, logOf[0] = -1
+    for (let i = 0, v = 1; i < 255; i++, v = slowMul(v, 2)) {
+      antilog[i] = v;
+      logOf[v] = i;
     }
-    for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+    const mod255 = (e) => ((e % 255) + 255) % 255;
+    const alpha = (e) => antilog[mod255(e)];
+    const mul = (a, b) => (a && b ? antilog[(logOf[a] + logOf[b]) % 255] : 0);
+    const inv = (a) => {
+      if (!a) throw new RangeError("GF(256): 0 has no inverse");
+      return antilog[mod255(-logOf[a])];
+    };
+    const div = (a, b) => mul(a, inv(b));
+    const pow = (a, k) => (a ? alpha(logOf[a] * k) : k === 0 ? 1 : 0);
+    return { alpha, mul, inv, div, pow, slowMul };
   })();
-  const gmul = (a, b) => (a === 0 || b === 0 ? 0 : EXP[LOG[a] + LOG[b]]);
-  const gpow = (a, n) => (a === 0 ? 0 : EXP[(LOG[a] * n) % 255]);
-  const ginv = (a) => EXP[255 - LOG[a]];
 
-  // polynomials are big-endian: p[0] is the highest-degree coefficient.
-  function polyMul(p, q) {
-    const r = new Uint8Array(p.length + q.length - 1);
-    for (let i = 0; i < p.length; i++)
-      if (p[i]) for (let j = 0; j < q.length; j++) r[i + j] ^= gmul(p[i], q[j]);
-    return r;
+  // ---- ascending-order polynomial helpers ----
+  const degreeOf = (p) => {
+    let d = p.length - 1;
+    while (d >= 0 && p[d] === 0) d--;
+    return d; // −1 for the zero polynomial
+  };
+  const trimmed = (p) => p.slice(0, degreeOf(p) + 1);
+  function polySum(p, q) {
+    const out = new Array(Math.max(p.length, q.length)).fill(0);
+    p.forEach((c, i) => { out[i] ^= c; });
+    q.forEach((c, i) => { out[i] ^= c; });
+    return out;
   }
-  function polyEval(p, x) {
-    let y = p[0];
-    for (let i = 1; i < p.length; i++) y = gmul(y, x) ^ p[i];
-    return y;
-  }
-  function polyScale(p, s) {
-    const r = new Uint8Array(p.length);
-    for (let i = 0; i < p.length; i++) r[i] = gmul(p[i], s);
-    return r;
-  }
-  function polyAdd(a, b) {
-    const r = new Uint8Array(Math.max(a.length, b.length));
-    for (let i = 0; i < a.length; i++) r[i + r.length - a.length] = a[i];
-    for (let i = 0; i < b.length; i++) r[i + r.length - b.length] ^= b[i];
-    return r;
-  }
-
-  function rsGenPoly(nsym) {
-    let g = Uint8Array.of(1);
-    for (let i = 0; i < nsym; i++) g = polyMul(g, Uint8Array.of(1, EXP[i]));
-    return g;
-  }
-  function rsEncode(data, nsym) {
-    const gen = rsGenPoly(nsym);
-    const res = new Uint8Array(data.length + nsym);
-    res.set(data);
-    for (let i = 0; i < data.length; i++) {
-      const coef = res[i];
-      if (coef !== 0)
-        for (let j = 0; j < gen.length; j++) res[i + j] ^= gmul(gen[j], coef);
-    }
-    return res.slice(data.length);
-  }
-
-  /* ---- RS decode: recover a corrupted codeword block ---- */
-  function rsSyndromes(msg, nsym) {
-    const s = new Uint8Array(nsym);
-    for (let i = 0; i < nsym; i++) s[i] = polyEval(msg, EXP[i]);
-    return s;
-  }
-  function rsErrorLocator(synd, nsym) {
-    let errLoc = Uint8Array.of(1);
-    let oldLoc = Uint8Array.of(1);
-    for (let i = 0; i < nsym; i++) {
-      let delta = synd[i];
-      for (let j = 1; j < errLoc.length; j++)
-        delta ^= gmul(errLoc[errLoc.length - 1 - j], synd[i - j]);
-      oldLoc = concat(oldLoc, Uint8Array.of(0));
-      if (delta !== 0) {
-        if (oldLoc.length > errLoc.length) {
-          const newLoc = polyScale(oldLoc, delta);
-          oldLoc = polyScale(errLoc, ginv(delta));
-          errLoc = newLoc;
-        }
-        errLoc = polyAdd(errLoc, polyScale(oldLoc, delta));
-      }
-    }
-    errLoc = stripLeadingZeros(errLoc);
-    return errLoc;
-  }
-  function rsErrorPositions(errLoc, n) {
-    // Λ(x) = ∏(1 - Y_p·x) with Y_p = α^(n-1-p); a position p is an error
-    // when Λ(Y_p⁻¹) = 0. (Chien search, matched to our syndrome convention.)
-    const errs = errLoc.length - 1;
-    const pos = [];
-    for (let p = 0; p < n; p++) {
-      const Yp = gpow(2, n - 1 - p);
-      if (polyEval(errLoc, ginv(Yp)) === 0) pos.push(p);
-    }
-    return pos.length === errs ? pos : null;
-  }
-  // Forney: given syndromes + error positions, compute & apply magnitudes.
-  function rsCorrect(msg, synd, errPos) {
-    const n = msg.length;
-    // error locator from positions
-    let q = Uint8Array.of(1);
-    const X = [];
-    for (const p of errPos) {
-      const Xi = gpow(2, n - 1 - p);
-      X.push(Xi);
-      q = polyMul(q, Uint8Array.of(Xi, 1)); // (Xi*x + 1)
-    }
-    // syndrome polynomial (big-endian, high degree first)
-    const sPoly = new Uint8Array(synd.length);
-    for (let i = 0; i < synd.length; i++) sPoly[i] = synd[synd.length - 1 - i];
-    // error evaluator Ω(x) = S(x)·Λ(x) mod x^nsym
-    let omega = polyMul(sPoly, q);
-    omega = omega.slice(Math.max(0, omega.length - synd.length));
-    // Forney per position
-    const out = msg.slice();
-    for (let k = 0; k < X.length; k++) {
-      const Xi = X[k];
-      const XiInv = ginv(Xi);
-      // formal derivative of Λ evaluated at Xi^-1 → product form
-      let denom = 1;
-      for (let j = 0; j < X.length; j++) {
-        if (j === k) continue;
-        denom = gmul(denom, 1 ^ gmul(XiInv, X[j]));
-      }
-      const num = polyEval(omega, XiInv);
-      // e = Ω(Xᵢ⁻¹) / Λ'(Xᵢ⁻¹); with fcr=0 the Xᵢ factor cancels against Λ'.
-      const magnitude = gmul(num, ginv(denom));
-      out[errPos[k]] ^= magnitude;
+  function polyProduct(p, q) {
+    if (!p.length || !q.length) return [];
+    const out = new Array(p.length + q.length - 1).fill(0);
+    for (let i = 0; i < p.length; i++) {
+      if (!p[i]) continue;
+      for (let j = 0; j < q.length; j++) out[i + j] ^= GF.mul(p[i], q[j]);
     }
     return out;
   }
-  // Returns {data, ecc, corrected, ok}. data/ecc are corrected codewords.
-  function rsDecodeBlock(codewords, nsym) {
-    const msg = Uint8Array.from(codewords);
-    const synd = rsSyndromes(msg, nsym);
-    let clean = true;
-    for (const s of synd) if (s !== 0) { clean = false; break; }
-    if (clean) return { msg, corrected: 0, ok: true };
-    const errLoc = rsErrorLocator(synd, nsym);
-    const pos = rsErrorPositions(errLoc, msg.length);
-    if (!pos) return { msg, corrected: -1, ok: false }; // beyond capacity
-    const fixed = rsCorrect(msg, synd, pos);
-    // verify
-    const s2 = rsSyndromes(fixed, nsym);
-    for (const s of s2) if (s !== 0) return { msg, corrected: -1, ok: false };
-    return { msg: fixed, corrected: pos.length, ok: true };
+  // value of p at x (ascending order: walk from the top coefficient down)
+  function polyAt(p, x) {
+    let acc = 0;
+    for (let i = p.length - 1; i >= 0; i--) acc = GF.mul(acc, x) ^ p[i];
+    return acc;
+  }
+  // long division a = quotient·b + remainder, b ≠ 0
+  function polyDivMod(a, b) {
+    const db = degreeOf(b);
+    const rem = trimmed(a);
+    const lead = GF.inv(b[db]);
+    const quot = new Array(Math.max(0, rem.length - db)).fill(0);
+    for (let k = rem.length - 1 - db; k >= 0; k--) {
+      const f = GF.mul(rem[k + db], lead);
+      if (!f) continue;
+      quot[k] = f;
+      for (let j = 0; j <= db; j++) rem[k + j] ^= GF.mul(f, b[j]);
+    }
+    return { quot, rem: trimmed(rem) };
+  }
+  // formal derivative; over GF(2^m) the even-power terms vanish
+  function polyDerivative(p) {
+    const out = new Array(Math.max(0, p.length - 1)).fill(0);
+    for (let i = 1; i < p.length; i += 2) out[i - 1] = p[i];
+    return out;
   }
 
-  function concat(a, b) {
-    const r = new Uint8Array(a.length + b.length);
-    r.set(a); r.set(b, a.length); return r;
+  // g(x) = ∏_{i=0}^{nsym−1} (x + α^i), ascending order
+  function generatorAscending(nsym) {
+    let g = [1];
+    for (let i = 0; i < nsym; i++) g = polyProduct(g, [GF.alpha(i), 1]);
+    return g;
   }
-  function stripLeadingZeros(p) {
-    let i = 0;
-    while (i < p.length - 1 && p[i] === 0) i++;
-    return p.slice(i);
+
+  // Exported: generator polynomial, highest power first (leading 1).
+  function rsGenPoly(nsym) {
+    return Uint8Array.from(generatorAscending(nsym).reverse());
   }
+
+  // Exported: the nsym check codewords for `data` (highest power first).
+  // Computed with a feedback shift register: each incoming byte plus the
+  // register's top cell is the feedback term that is multiplied by g(x)
+  // and folded into the register (division by g, keeping the remainder).
+  function rsEncode(data, nsym) {
+    const g = generatorAscending(nsym); // g[nsym] = 1
+    const reg = new Array(nsym).fill(0); // reg[j] = coefficient of x^j of the remainder
+    for (const byte of data) {
+      const fb = byte ^ reg[nsym - 1];
+      for (let j = nsym - 1; j > 0; j--) reg[j] = reg[j - 1] ^ GF.mul(fb, g[j]);
+      reg[0] = GF.mul(fb, g[0]);
+    }
+    return Uint8Array.from(reg.reverse());
+  }
+
+  // Exported: S_j = r(α^j) for j = 0 … nsym−1, where r is the received
+  // block read as a polynomial with its first byte as the highest power.
+  function rsSyndromes(block, nsym) {
+    const s = new Uint8Array(nsym);
+    for (let j = 0; j < nsym; j++) {
+      const x = GF.alpha(j);
+      let acc = 0;
+      for (let i = 0; i < block.length; i++) acc = GF.mul(acc, x) ^ block[i];
+      s[j] = acc;
+    }
+    return s;
+  }
+
+  // Key equation Λ(x)·S(x) ≡ Ω(x) (mod x^nsym) solved by running Euclid's
+  // algorithm on (x^nsym, S(x)) and stopping once the remainder's degree
+  // drops below nsym/2 (Sugiyama et al.). Returns Λ normalised to Λ(0) = 1
+  // and the matching Ω, or null when no valid locator exists.
+  function solveKeyEquation(synd, nsym) {
+    let rPrev = new Array(nsym + 1).fill(0);
+    rPrev[nsym] = 1; // x^nsym
+    let rCur = trimmed(Array.from(synd));
+    let tPrev = [];
+    let tCur = [1];
+    while (2 * degreeOf(rCur) >= nsym) {
+      const { quot, rem } = polyDivMod(rPrev, rCur);
+      const tNext = polySum(tPrev, polyProduct(quot, tCur));
+      rPrev = rCur; rCur = rem;
+      tPrev = tCur; tCur = trimmed(tNext);
+    }
+    const c0 = tCur[0] || 0;
+    if (!c0) return null;
+    const scale = GF.inv(c0);
+    return {
+      locator: tCur.map((c) => GF.mul(c, scale)),
+      evaluator: rCur.map((c) => GF.mul(c, scale)),
+    };
+  }
+
+  // Chien search: test Λ(α^−e) for every exponent e of the block (0 … n−1).
+  // Term j of Λ is carried along as λ_j·α^(−j·e) and stepped by α^(−j).
+  function chienSearch(locator, n) {
+    const terms = locator.slice();
+    const steps = locator.map((_, j) => GF.alpha(-j));
+    const hits = [];
+    for (let e = 0; e < n; e++) {
+      let sum = 0;
+      for (let j = 0; j < terms.length; j++) sum ^= terms[j];
+      if (sum === 0) hits.push(e);
+      for (let j = 1; j < terms.length; j++) terms[j] = GF.mul(terms[j], steps[j]);
+    }
+    return hits;
+  }
+
+  // Exported: correct one block [data…, check…]. Returns
+  // { msg: Uint8Array, corrected: number of bytes fixed (−1 on failure), ok }.
+  function rsDecodeBlock(codewords, nsym) {
+    const received = Uint8Array.from(codewords);
+    const n = received.length;
+    const synd = rsSyndromes(received, nsym);
+    if (synd.every((s) => s === 0)) return { msg: received, corrected: 0, ok: true };
+    const fail = { msg: received, corrected: -1, ok: false };
+
+    const key = solveKeyEquation(synd, nsym);
+    if (!key) return fail;
+    const { locator, evaluator } = key;
+    const nu = degreeOf(locator);
+    if (nu < 1 || 2 * nu > nsym) return fail;
+    const exps = chienSearch(locator, n);
+    if (exps.length !== nu) return fail; // roots outside the block or repeated
+
+    // Forney (first consecutive root α^0): Y = X·Ω(X⁻¹) / Λ'(X⁻¹), X = α^e
+    const dLocator = polyDerivative(locator);
+    const fixed = received.slice();
+    for (const e of exps) {
+      const xInv = GF.alpha(-e);
+      const denom = polyAt(dLocator, xInv);
+      if (!denom) return fail;
+      const magnitude = GF.mul(GF.alpha(e), GF.div(polyAt(evaluator, xInv), denom));
+      fixed[n - 1 - e] ^= magnitude;
+    }
+    if (rsSyndromes(fixed, nsym).some((s) => s !== 0)) return fail;
+    return { msg: fixed, corrected: nu, ok: true };
+  }
+
+  // names kept for the low-level test export
+  const gmul = GF.mul;
+  const gpow = GF.pow;
+  const ginv = GF.inv;
 
   /* ---------------- QR error-correction tables (v1–10) ---------------- */
   // ECC[version][level] = [ecPerBlock, [[count, dataPer], ...]]  level L,M,Q,H
@@ -598,7 +660,7 @@
   const QR = {
     encode, decode, readCodewords,
     // low-level, exposed for tests
-    _gf: { gmul, gpow, ginv }, _rs: { rsEncode, rsDecodeBlock, rsGenPoly, rsSyndromes, rsErrorLocator, rsErrorPositions, rsCorrect },
+    _gf: { gmul, gpow, ginv }, _rs: { rsEncode, rsDecodeBlock, rsGenPoly, rsSyndromes, solveKeyEquation, chienSearch },
     _tables: { ECC, ALIGN }, dataCapacityBytes, chooseVersion,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = QR;
